@@ -1,0 +1,28 @@
+MAGNET NA MAY CONTROL SA SERIAL MONITOR 
+
+const int PIN_MAGNET = 21;
+
+void magnetOn() {
+  digitalWrite(PIN_MAGNET, LOW); 
+  Serial.println("Magnet ON");
+}
+
+void magnetOff() {
+  digitalWrite(PIN_MAGNET, HIGH); 
+  Serial.println("Magnet OFF");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_MAGNET, OUTPUT_OPEN_DRAIN);
+  magnetOff();
+  Serial.println("Type 1 = ON, 0 = OFF");
+}
+
+void loop() {
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == '1') magnetOn();
+    else if (c == '0') magnetOff();
+  }
+}
