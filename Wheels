@@ -1,0 +1,277 @@
+CONNECTED TO SA WEBSITE
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ---------- Wi-Fi ----------
+const char* ssid = "reni"; //Change SSID and Password depends sa naka connect
+const char* password = "robot12345";
+
+const bool USE_STATIC_IP = false;
+IPAddress local_IP(192, 168, 1, 150);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(8, 8, 8, 8);
+
+WebServer server(80);
+
+// ---------- Motor pins ----------
+const int IN1 = 26;
+const int IN2 = 27;
+const int IN3 = 33;
+const int IN4 = 32;
+const int ENA = 25;
+const int ENB = 14;
+
+// ---------- Electromagnet ----------
+const int MAGNET_PIN = 23;
+
+// ---------- Motor settings ----------
+const bool INVERT_LEFT  = false;
+const bool INVERT_RIGHT = true;
+const int SPEED = 200;
+const int TURN_SPEED = 180;
+
+const unsigned long COMMAND_TIMEOUT_MS = 800;
+
+unsigned long lastCommandTime = 0;
+bool moving = false;
+unsigned long lastReconnectTry = 0;
+
+// ---------- Robot state reported to the website ----------
+String movementName = "Stopped";
+String lastCommandName = "None";
+bool magnetOn = false;
+int baseAngle = 90;
+int elbowAngle = 90;
+int wristAngle = 90;
+int collectedCount = 0;
+
+void driveMotor(int inA, int inB, int enPin, int speed, bool invert) {
+  if (invert) speed = -speed;
+
+  if (speed > 0) {
+    digitalWrite(inA, HIGH);
+    digitalWrite(inB, LOW);
+  } else if (speed < 0) {
+    digitalWrite(inA, LOW);
+    digitalWrite(inB, HIGH);
+  } else {
+    digitalWrite(inA, LOW);
+    digitalWrite(inB, LOW);
+  }
+  ledcWrite(enPin, constrain(abs(speed), 0, 255));
+}
+
+void setMotors(int leftSpeed, int rightSpeed) {
+  moving = (leftSpeed != 0 || rightSpeed != 0);
+  driveMotor(IN1, IN2, ENA, leftSpeed, INVERT_LEFT);
+  driveMotor(IN3, IN4, ENB, rightSpeed, INVERT_RIGHT);
+}
+
+void forward()   { setMotors(SPEED, SPEED);             movementName = "Forward"; }
+void backward()  { setMotors(-SPEED, -SPEED);           movementName = "Backward"; }
+void turnLeft()  { setMotors(-TURN_SPEED, TURN_SPEED);  movementName = "Left"; }
+void turnRight() { setMotors(TURN_SPEED, -TURN_SPEED);  movementName = "Right"; }
+void stopAll()   { setMotors(0, 0);                     movementName = "Stopped"; }
+
+void addCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "*");
+}
+
+void sendStatus() {
+  String json = "{";
+  json += "\"movement\":\"" + movementName + "\",";
+  json += "\"magnet\":" + String(magnetOn ? "true" : "false") + ",";
+  json += "\"lastCommand\":\"" + lastCommandName + "\",";
+  json += "\"busy\":\"\",";
+  json += "\"collected\":" + String(collectedCount) + ",";
+  json += "\"battery\":null,";
+  json += "\"batteryV\":null,";
+  json += "\"metal\":null,";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"base\":" + String(baseAngle) + ",";
+  json += "\"elbow\":" + String(elbowAngle) + ",";
+  json += "\"wrist\":" + String(wristAngle) + ",";
+  json += "\"uptime\":" + String(millis() / 1000);
+  json += "}";
+
+  addCorsHeaders();
+  server.send(200, "application/json", json);
+}
+
+void handleMove() {
+  String dir = server.arg("dir");
+  Serial.print("Move request: ");
+  Serial.println(dir);
+
+  if (dir.equalsIgnoreCase("Forward") || dir.equalsIgnoreCase("Up")) {
+    forward();
+  } else if (dir.equalsIgnoreCase("Backward") || dir.equalsIgnoreCase("Reverse") ||
+             dir.equalsIgnoreCase("Back") || dir.equalsIgnoreCase("Down")) {
+    backward();
+  } else if (dir.equalsIgnoreCase("Left")) {
+    turnLeft();
+  } else if (dir.equalsIgnoreCase("Right")) {
+    turnRight();
+  } else {
+    stopAll();
+    dir = "Stop";
+  }
+
+  lastCommandName = dir;
+  lastCommandTime = millis();
+  sendStatus();
+}
+
+// /magnet?state=on | off
+void handleMagnet() {
+  magnetOn = server.arg("state").equalsIgnoreCase("on");
+  digitalWrite(MAGNET_PIN, magnetOn ? HIGH : LOW);
+  lastCommandName = magnetOn ? "Magnet ON" : "Magnet OFF";
+  sendStatus();
+}
+
+void handleArm() {
+  if (server.hasArg("base"))  baseAngle  = constrain(server.arg("base").toInt(),  0, 180);
+  if (server.hasArg("elbow")) elbowAngle = constrain(server.arg("elbow").toInt(), 0, 180);
+  if (server.hasArg("wrist")) wristAngle = constrain(server.arg("wrist").toInt(), 0, 180);
+  lastCommandName = "Arm position";
+  // TODO: write baseAngle / elbowAngle / wristAngle to your servos here.
+  sendStatus();
+}
+
+void handleCollect() {
+  lastCommandName = "Collect metal";
+  // TODO: arm collect sequence, then collectedCount++
+  sendStatus();
+}
+
+void handleUnload() {
+  lastCommandName = "Unload bin";
+  sendStatus();
+}
+
+void handleCommand(const char* name, void (*action)()) {
+  Serial.print("Command: ");
+  Serial.println(name);
+  action();
+  lastCommandName = name;
+  lastCommandTime = millis();
+  addCorsHeaders();
+  server.send(200, "text/plain", "OK");
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true); // Clear cache
+  delay(100);
+
+  if (USE_STATIC_IP) {
+    if (!WiFi.config(local_IP, gateway, subnet, dns)) {
+      Serial.println("Static IP config failed, using DHCP.");
+    }
+  }
+
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  WiFi.setSleep(false); 
+
+  Serial.println("");
+  Serial.println("Wi-Fi connected.");
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(MAGNET_PIN, OUTPUT);
+  digitalWrite(MAGNET_PIN, LOW); 
+
+  ledcAttach(ENA, 1000, 8);
+  ledcAttach(ENB, 1000, 8);
+
+  stopAll();
+  connectWiFi();
+
+  // NOTE: server.enableCORS() was removed on purpose. It added a second
+  // Access-Control-Allow-Origin header, which made Chrome reject every reply.
+
+  // Root page
+  server.on("/", []() {
+    addCorsHeaders();
+    server.send(200, "text/plain", "Magnetrieve ESP32 Robot Server Online");
+  });
+
+  // Routes used by the website (robot.js)
+  server.on("/status",  sendStatus);
+  server.on("/move",    handleMove);
+  server.on("/magnet",  handleMagnet);
+  server.on("/arm",     handleArm);
+  server.on("/collect", handleCollect);
+  server.on("/unload",  handleUnload);
+
+  // Old plain-text drive routes
+  server.on("/forward",  []() { handleCommand("FORWARD",  forward);   });
+  server.on("/backward", []() { handleCommand("BACKWARD", backward);  });
+  server.on("/left",     []() { handleCommand("LEFT",     turnLeft);  });
+  server.on("/right",    []() { handleCommand("RIGHT",    turnRight); });
+  server.on("/stop",     []() { handleCommand("STOP",     stopAll);   });
+
+  server.on("/ping", []() {
+    addCorsHeaders();
+    server.send(200, "text/plain", "pong");
+  });
+
+  // Handles browser preflight requests and unknown paths
+  server.onNotFound([]() {
+    addCorsHeaders();
+    if (server.method() == HTTP_OPTIONS) {
+      server.send(204);
+    } else {
+      server.send(404, "text/plain", "Not found");
+    }
+  });
+
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+void loop() {
+  server.handleClient();
+
+  // Safety: stop the robot if Wi-Fi is lost, and try to reconnect
+  if (WiFi.status() != WL_CONNECTED) {
+    if (moving) {
+      stopAll();
+      Serial.println("Wi-Fi lost - motors stopped.");
+    }
+    if (millis() - lastReconnectTry > 5000) {
+      lastReconnectTry = millis();
+      Serial.println("Reconnecting to Wi-Fi...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
+  }
+
+  // Safety: stop if drive commands stop arriving
+  if (COMMAND_TIMEOUT_MS > 0 && moving &&
+      millis() - lastCommandTime > COMMAND_TIMEOUT_MS) {
+    stopAll();
+    Serial.println("Command timeout - motors stopped.");
+  }
+}
