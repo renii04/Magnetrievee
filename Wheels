@@ -1,5 +1,3 @@
-CONNECTED TO SA WEBSITE
-
 #include <WiFi.h>
 #include <WebServer.h>
 
