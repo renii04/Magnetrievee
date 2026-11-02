@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESP32Servo.h>
 
 // ---------- Wi-Fi ----------
 const char* ssid = "reni"; //Change SSID and Password depends sa naka connect
@@ -22,7 +23,42 @@ const int ENA = 25;
 const int ENB = 14;
 
 // ---------- Electromagnet ----------
-const int MAGNET_PIN = 23;
+const int MAGNET_PIN = 21;
+
+// ---------- Servo pins ----------
+const int PIN_ELBOW = 18;
+const int PIN_WRIST = 4;
+const int PIN_BASE  = 23; 
+
+// ---------- Servo pulse widths ----------
+const int MG90S_MIN_US  = 500;
+const int MG90S_MAX_US  = 2400;
+const int MG996R_MIN_US = 500;
+const int MG996R_MAX_US = 2500;
+
+// ---------- Elbow and wrist ----------
+const int ELBOW_UP   = 90;
+const int ELBOW_DOWN = 155;
+const int WRIST_UP   = 90;
+const int WRIST_DOWN = 150;
+const int ELBOW_STEP_DELAY = 40; 
+const int WRIST_STEP_DELAY = 35;
+
+// ---------- Base (MG996R, continuous rotation, moved by TIME) ----------
+const int   BASE_STOP           = 90; 
+const int   BASE_SPEED          = 6; 
+const float BASE_MS_PER_DEGREE  = 22.2;
+const int   BASE_START_ANGLE    = 0; 
+const int   BASE_MAX_ANGLE      = 180; 
+const int   BASE_BIN_ANGLE      = 180;
+const int   BASE_MIN_MOVE_DEG   = 2;
+
+// ---------- Collect sequence pauses (ms) ----------
+const unsigned long PAUSE_BETWEEN_STEPS = 1000;
+const unsigned long PICKUP_TIME         = 1500;
+const unsigned long BEFORE_BASE_DELAY   = 4000;
+const unsigned long BIN_TIME            = 1500;
+const unsigned long CYCLE_END_PAUSE     = 1000;
 
 // ---------- Motor settings ----------
 const bool INVERT_LEFT  = false;
@@ -39,12 +75,42 @@ unsigned long lastReconnectTry = 0;
 // ---------- Robot state reported to the website ----------
 String movementName = "Stopped";
 String lastCommandName = "None";
+String busyName = "";
 bool magnetOn = false;
-int baseAngle = 90;
-int elbowAngle = 90;
-int wristAngle = 90;
+int baseAngle  = BASE_START_ANGLE;
+int elbowAngle = ELBOW_UP;
+int wristAngle = WRIST_UP;
 int collectedCount = 0;
 
+// ---------- Servo objects and targets ----------
+Servo elbow;
+Servo wrist;
+Servo base;
+
+int elbowTarget = ELBOW_UP;
+int wristTarget = WRIST_UP;
+unsigned long lastElbowStep = 0;
+unsigned long lastWristStep = 0;
+
+bool baseRotating = false;
+int baseTarget = BASE_START_ANGLE;
+int basePendingTarget = -1;          // base waits here until elbow and wrist are done
+unsigned long baseStart = 0;
+unsigned long baseDuration = 0;
+unsigned long baseDetachAt = 0;
+
+// ---------- Collect sequence ----------
+enum Step {
+  S_IDLE, S_ELBOW_DOWN, S_PAUSE_1, S_WRIST_DOWN, S_PICKUP, S_WRIST_UP,
+  S_PAUSE_2, S_ELBOW_UP, S_BEFORE_BASE, S_BASE_TO_BIN, S_DROP, S_BASE_BACK, S_FINISH
+};
+Step collectStep = S_IDLE;
+unsigned long stepStart = 0;
+int collectStartBase = BASE_START_ANGLE;
+
+// =====================================================
+// Wheels
+// =====================================================
 void driveMotor(int inA, int inB, int enPin, int speed, bool invert) {
   if (invert) speed = -speed;
 
@@ -73,6 +139,139 @@ void turnLeft()  { setMotors(-TURN_SPEED, TURN_SPEED);  movementName = "Left"; }
 void turnRight() { setMotors(TURN_SPEED, -TURN_SPEED);  movementName = "Right"; }
 void stopAll()   { setMotors(0, 0);                     movementName = "Stopped"; }
 
+// =====================================================
+// Magnet
+// =====================================================
+void setMagnet(bool on) {
+  magnetOn = on;
+  digitalWrite(MAGNET_PIN, on ? HIGH : LOW);
+}
+
+// =====================================================
+// Arm: elbow and wrist (smooth, non-blocking)
+// =====================================================
+bool jointsIdle() {
+  return (elbowAngle == elbowTarget) && (wristAngle == wristTarget);
+}
+
+bool armIdle() {
+  return jointsIdle() && !baseRotating && basePendingTarget < 0;
+}
+
+void updateJoints() {
+  unsigned long now = millis();
+
+  if (elbowAngle != elbowTarget && now - lastElbowStep >= ELBOW_STEP_DELAY) {
+    lastElbowStep = now;
+    elbowAngle += (elbowTarget > elbowAngle) ? 1 : -1;
+    elbow.write(elbowAngle);
+  }
+
+  if (wristAngle != wristTarget && now - lastWristStep >= WRIST_STEP_DELAY) {
+    lastWristStep = now;
+    wristAngle += (wristTarget > wristAngle) ? 1 : -1;
+    wrist.write(wristAngle);
+  }
+}
+
+// =====================================================
+// Arm: base (timed rotation, non-blocking)
+// =====================================================
+void startBase(int target) {
+  target = constrain(target, 0, BASE_MAX_ANGLE);
+  int delta = target - baseAngle;
+  if (abs(delta) < BASE_MIN_MOVE_DEG) return;
+
+  int dir = (delta > 0) ? 1 : -1;
+  baseTarget = target;
+  baseDuration = (unsigned long)(abs(delta) * BASE_MS_PER_DEGREE);
+
+  if (!base.attached()) {
+    base.setPeriodHertz(50);
+    base.attach(PIN_BASE, MG996R_MIN_US, MG996R_MAX_US);
+  }
+  base.write(BASE_STOP + dir * BASE_SPEED);
+  baseStart = millis();
+  baseDetachAt = 0;
+  baseRotating = true;
+}
+
+void updateBase() {
+  unsigned long now = millis();
+
+  // Finished rotating: stop, then detach after a short moment
+  if (baseRotating && now - baseStart >= baseDuration) {
+    base.write(BASE_STOP);
+    baseAngle = baseTarget;
+    baseRotating = false;
+    baseDetachAt = now + 300;
+  }
+
+  if (baseDetachAt != 0 && !baseRotating && now >= baseDetachAt) {
+    base.detach();   // no signal = the base cannot creep
+    baseDetachAt = 0;
+  }
+
+  // A base move from the website only starts once elbow and wrist are done
+  if (!baseRotating && basePendingTarget >= 0 && jointsIdle()) {
+    int t = basePendingTarget;
+    basePendingTarget = -1;
+    startBase(t);
+  }
+}
+
+// =====================================================
+// Collect sequence (runs in the background)
+// =====================================================
+bool isMoveStep(Step s) {
+  return s == S_ELBOW_DOWN || s == S_WRIST_DOWN || s == S_WRIST_UP ||
+         s == S_ELBOW_UP || s == S_BASE_TO_BIN || s == S_BASE_BACK;
+}
+
+unsigned long stepWait(Step s) {
+  switch (s) {
+    case S_PAUSE_1:
+    case S_PAUSE_2:     return PAUSE_BETWEEN_STEPS;
+    case S_PICKUP:      return PICKUP_TIME;
+    case S_BEFORE_BASE: return BEFORE_BASE_DELAY;
+    case S_DROP:        return BIN_TIME;
+    case S_FINISH:      return CYCLE_END_PAUSE;
+    default:            return 0;
+  }
+}
+
+void gotoStep(Step s) {
+  collectStep = s;
+  stepStart = millis();
+
+  switch (s) {
+    case S_ELBOW_DOWN:  setMagnet(true);  elbowTarget = ELBOW_DOWN; break;
+    case S_WRIST_DOWN:  wristTarget = WRIST_DOWN; break;
+    case S_WRIST_UP:    wristTarget = WRIST_UP;   break;
+    case S_ELBOW_UP:    elbowTarget = ELBOW_UP;   break;
+    case S_BASE_TO_BIN: startBase(BASE_BIN_ANGLE); break;
+    case S_DROP:        setMagnet(false); collectedCount++; break;
+    case S_BASE_BACK:   startBase(collectStartBase); break;
+    case S_IDLE:        busyName = ""; break;
+    default: break;
+  }
+}
+
+void updateCollect() {
+  if (collectStep == S_IDLE) return;
+
+  bool done = isMoveStep(collectStep)
+                ? armIdle()
+                : (millis() - stepStart >= stepWait(collectStep));
+  if (!done) return;
+
+  if (collectStep == S_FINISH) gotoStep(S_IDLE);
+  else gotoStep((Step)(collectStep + 1));
+}
+
+// =====================================================
+// Web server
+// =====================================================
 void addCorsHeaders() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -84,7 +283,7 @@ void sendStatus() {
   json += "\"movement\":\"" + movementName + "\",";
   json += "\"magnet\":" + String(magnetOn ? "true" : "false") + ",";
   json += "\"lastCommand\":\"" + lastCommandName + "\",";
-  json += "\"busy\":\"\",";
+  json += "\"busy\":\"" + busyName + "\",";
   json += "\"collected\":" + String(collectedCount) + ",";
   json += "\"battery\":null,";
   json += "\"batteryV\":null,";
@@ -126,24 +325,38 @@ void handleMove() {
 
 // /magnet?state=on | off
 void handleMagnet() {
-  magnetOn = server.arg("state").equalsIgnoreCase("on");
-  digitalWrite(MAGNET_PIN, magnetOn ? HIGH : LOW);
+  setMagnet(server.arg("state").equalsIgnoreCase("on"));
   lastCommandName = magnetOn ? "Magnet ON" : "Magnet OFF";
   sendStatus();
 }
 
+// /arm?base=..&elbow=..&wrist=..
 void handleArm() {
-  if (server.hasArg("base"))  baseAngle  = constrain(server.arg("base").toInt(),  0, 180);
-  if (server.hasArg("elbow")) elbowAngle = constrain(server.arg("elbow").toInt(), 0, 180);
-  if (server.hasArg("wrist")) wristAngle = constrain(server.arg("wrist").toInt(), 0, 180);
+  if (collectStep != S_IDLE) {
+    lastCommandName = "Arm busy (collecting)";
+    sendStatus();
+    return;
+  }
+
+  if (server.hasArg("elbow")) elbowTarget = constrain(server.arg("elbow").toInt(), 0, 180);
+  if (server.hasArg("wrist")) wristTarget = constrain(server.arg("wrist").toInt(), 0, 180);
+  if (server.hasArg("base"))  basePendingTarget = constrain(server.arg("base").toInt(), 0, BASE_MAX_ANGLE);
+
   lastCommandName = "Arm position";
-  // TODO: write baseAngle / elbowAngle / wristAngle to your servos here.
   sendStatus();
 }
 
+// /collect  -> runs the whole pick-up and drop sequence in the background
 void handleCollect() {
-  lastCommandName = "Collect metal";
-  // TODO: arm collect sequence, then collectedCount++
+  if (collectStep != S_IDLE || baseRotating) {
+    lastCommandName = "Collect busy";
+  } else {
+    collectStartBase = baseAngle;
+    basePendingTarget = -1;
+    busyName = "Collecting";
+    lastCommandName = "Collect metal";
+    gotoStep(S_ELBOW_DOWN);
+  }
   sendStatus();
 }
 
@@ -182,7 +395,7 @@ void connectWiFi() {
     Serial.print(".");
   }
 
-  WiFi.setSleep(false); 
+  WiFi.setSleep(false);
 
   Serial.println("");
   Serial.println("Wi-Fi connected.");
@@ -198,8 +411,20 @@ void setup() {
   pinMode(IN3, OUTPUT);
   pinMode(IN4, OUTPUT);
   pinMode(MAGNET_PIN, OUTPUT);
-  digitalWrite(MAGNET_PIN, LOW); 
+  digitalWrite(MAGNET_PIN, LOW);
 
+  // Servos first (elbow and wrist only; the base is attached only while it moves)
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  elbow.setPeriodHertz(50);
+  wrist.setPeriodHertz(50);
+  elbow.attach(PIN_ELBOW, MG90S_MIN_US, MG90S_MAX_US);
+  wrist.attach(PIN_WRIST, MG90S_MIN_US, MG90S_MAX_US);
+  elbow.write(elbowAngle);
+  wrist.write(wristAngle);
+
+  // Wheels
   ledcAttach(ENA, 1000, 8);
   ledcAttach(ENB, 1000, 8);
 
@@ -251,6 +476,11 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // Arm updates (all non-blocking, so the website and wheels stay responsive)
+  updateJoints();
+  updateBase();
+  updateCollect();
 
   // Safety: stop the robot if Wi-Fi is lost, and try to reconnect
   if (WiFi.status() != WL_CONNECTED) {
