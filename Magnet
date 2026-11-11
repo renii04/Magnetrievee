@@ -1,28 +1,38 @@
-MAGNET NA MAY CONTROL SA SERIAL MONITOR 
+const int SOLENOID_PIN = 21;
 
-const int PIN_MAGNET = 21;
-
-void magnetOn() {
-  digitalWrite(PIN_MAGNET, LOW); 
-  Serial.println("Magnet ON");
-}
-
-void magnetOff() {
-  digitalWrite(PIN_MAGNET, HIGH); 
-  Serial.println("Magnet OFF");
-}
+const int SOLENOID_ON_LEVEL  = LOW;
+const int SOLENOID_OFF_LEVEL = HIGH;
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_MAGNET, OUTPUT_OPEN_DRAIN);
-  magnetOff();
-  Serial.println("Type 1 = ON, 0 = OFF");
+
+  digitalWrite(SOLENOID_PIN, SOLENOID_OFF_LEVEL);
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, SOLENOID_OFF_LEVEL);
+3
+  Serial.println("Magnetrieve Manual Control Ready!");
+  Serial.println("Type '1' or 'ON' to turn Solenoid ON");
+  Serial.println("Type '0' or 'OFF' to turn Solenoid OFF");
 }
 
 void loop() {
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c == '1') magnetOn();
-    else if (c == '0') magnetOff();
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toUpperCase();
+
+    if (command == "1" || command == "ON") {
+      digitalWrite(SOLENOID_PIN, SOLENOID_ON_LEVEL);
+      Serial.println("--> [COMMAND RECEIVED] Solenoid: ON");
+    }
+    else if (command == "0" || command == "OFF") {
+      digitalWrite(SOLENOID_PIN, SOLENOID_OFF_LEVEL);
+      Serial.println("--> [COMMAND RECEIVED] Solenoid: OFF");
+    }
+    else {
+      Serial.print("--> Invalid Command: '");
+      Serial.print(command);
+      Serial.println("'. Please type '1', '0', 'ON', or 'OFF'.");
+    }
   }
 }
